@@ -2,7 +2,7 @@
 
 ## 项目说明
 
-当前项目是基于[liuw1535](https://github.com/liuw1535)大佬的(antigravity2api-nodejs)[https://github.com/liuw1535/antigravity2api-nodejs]做的修改和迭代
+当前项目是基于[liuw1535](https://github.com/liuw1535) 大佬的 [antigravity2api-nodejs](https://github.com/liuw1535/antigravity2api-nodejs) 做的修改和迭代
 
 ## 免责声明
 
@@ -46,6 +46,10 @@ services:
 ## 环境变量配置
 
 详见`.env.example`文件
+
+## 文档
+
+[点击访问](https://docs.zxiaoruan.cn/antigravity2api/%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B/docker)
 
 ## 交流
 

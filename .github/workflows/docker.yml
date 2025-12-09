@@ -3,7 +3,17 @@ name: Build and Deploy Docker
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'docker-compose.yml'
+      - '.gitignore'
+      - '.env.example'
   pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docker-compose.yml'
+      - '.gitignore'
+      - '.env.example'
   workflow_dispatch:
 
 env:
