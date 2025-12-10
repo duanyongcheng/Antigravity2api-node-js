@@ -1612,29 +1612,34 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
         responseSummaryForLog = { text: content };
       } else {
         let hasToolCall = false;
+        let isFirstChunk = true;
         const { usage } = await generateAssistantResponse(requestBody, token, data => {
           streamEventsForLog.push(data);
 
           let delta = {};
+
+          // OpenAI 流式规范要求首个 chunk 必须包含 role: 'assistant'
+          if (isFirstChunk) {
+            isFirstChunk = false;
+            delta.role = 'assistant';
+          }
           if (data.type === 'tool_calls') {
             // 为兼容 OpenAI 流式规范，这里补充 index 字段
-            delta = {
-              tool_calls: (data.tool_calls || []).map((toolCall, index) => ({
-                index,
-                id: toolCall.id,
-                type: toolCall.type,
-                function: toolCall.function
-              }))
-            };
+            delta.tool_calls = (data.tool_calls || []).map((toolCall, index) => ({
+              index,
+              id: toolCall.id,
+              type: toolCall.type,
+              function: toolCall.function
+            }));
           } else if (data.type === 'thinking') {
             // 思维链内容直接放入 reasoning_content（不包含标签）
             const cleanContent = data.content.replace(/^<思考>\n?|\n?<\/思考>$/g, '');
-            delta = { reasoning_content: cleanContent };
+            delta.reasoning_content = cleanContent;
           } else if (data.type === 'text') {
             // 普通文本内容放入 content（需要过滤掉思考标签）
             const cleanContent = data.content.replace(/<思考>[\s\S]*?<\/思考>/g, '');
             if (cleanContent) {
-              delta = { content: cleanContent };
+              delta.content = cleanContent;
             }
           }
 
