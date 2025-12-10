@@ -320,6 +320,29 @@ function generateRequestBody(openaiMessages, modelName, parameters, openaiTools,
         msg.tool_calls.length > 0
     );
 
+  // 检测对话中是否存在没有 thinking block 的 assistant 消息
+  // Claude API 要求：当 thinking 启用时，assistant 消息必须以 thinking block 开头
+  const hasAssistantWithoutThinking =
+    Array.isArray(openaiMessages) &&
+    openaiMessages.some((msg) => {
+      if (!msg || msg.role !== 'assistant') return false;
+      // 检查 content 是否包含 thinking block
+      if (Array.isArray(msg.content)) {
+        const hasThinkingBlock = msg.content.some(
+          (item) => item && item.type === 'thinking'
+        );
+        // 如果有内容但没有 thinking block，则返回 true
+        const hasTextContent = msg.content.some(
+          (item) => item && item.type === 'text' && item.text
+        );
+        return hasTextContent && !hasThinkingBlock;
+      } else if (typeof msg.content === 'string' && msg.content.trim()) {
+        // 字符串内容：检查是否包含 <thinking> 标签
+        return !/<thinking>[\s\S]*?<\/thinking>/i.test(msg.content);
+      }
+      return false;
+    });
+
   // 基础的思维链启用逻辑：按模型名判断
   const baseEnableThinking =
     modelName.endsWith('-thinking') ||
@@ -328,12 +351,12 @@ function generateRequestBody(openaiMessages, modelName, parameters, openaiTools,
     modelName === "rev19-uic3-1p" ||
     modelName === "gpt-oss-120b-medium";
 
-  // 为避免 Anthropic thinking + tools 触发
-  // “messages.*.content[0].type 必须是 thinking” 的报错，
-  // 当使用 Claude 系列思维模型且历史中已出现工具调用时，关闭 thinking。
+  // 为避免 Anthropic thinking 模式报错，关闭 thinking 的条件：
+  // 1. 历史中已出现工具调用
+  // 2. 历史中存在没有 thinking block 的 assistant 消息
   const enableThinking =
     baseEnableThinking &&
-    !(actualModelName.includes('claude') && hasAssistantToolCalls);
+    !(actualModelName.includes('claude') && (hasAssistantToolCalls || hasAssistantWithoutThinking));
 
   // 先将 OpenAI 风格 messages 转换为 Antigravity/Gemini contents
   const contents = openaiMessageToAntigravity(openaiMessages, actualModelName);
