@@ -138,33 +138,6 @@ async function withRequesterFallback(fn) {
     }
 }
 
-function buildGeminiRequest(model, requestBody = {}, token) {
-    const { generationConfig, systemInstruction, sessionId, ...rest } = requestBody;
-
-    return {
-        project: token.projectId,
-        requestId: generateRequestId(),
-        request: {
-            systemInstruction:
-                systemInstruction || {
-                    role: 'user',
-                    parts: [{ text: config.systemInstruction }]
-                },
-            generationConfig: {
-                topP: config.defaults.top_p,
-                topK: config.defaults.top_k,
-                temperature: config.defaults.temperature,
-                maxOutputTokens: config.defaults.max_tokens,
-                ...(generationConfig || {})
-            },
-            sessionId: sessionId || token.sessionId,
-            ...rest
-        },
-        model,
-        userAgent: 'antigravity'
-    };
-}
-
 function statusFromStatusText(statusText) {
     if (!statusText) return null;
 
@@ -551,21 +524,20 @@ export async function getAvailableModels() {
     }
 }
 
-export async function generateAssistantResponseNoStream(requestBody, token) {
-
-    let data;
-    let aggregatedText = '';
-    let aggregatedTextSignature = null;
-
-    try {
-        data = await withRequesterFallback(async currentUseAxios => withRetry(async (currentToken) => {
+// 内部复用的非流式请求封装，返回上游原始 JSON，方便不同上层按需解析
+async function callNoStreamApi(requestBody, token) {
+    return await withRequesterFallback(async currentUseAxios =>
+        withRetry(async (currentToken) => {
             const headers = buildHeaders(currentToken);
 
             if (currentUseAxios) {
                 return (await axios(buildAxiosConfig(config.api.noStreamUrl, headers, requestBody))).data;
             }
 
-            const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
+            const response = await requester.antigravity_fetch(
+                config.api.noStreamUrl,
+                buildRequesterConfig(headers, requestBody)
+            );
             const bodyText = await response.text();
             const embeddedError = detectEmbeddedError(bodyText);
 
@@ -579,7 +551,18 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
             }
 
             return JSON.parse(bodyText);
-        }, token));
+        }, token)
+    );
+}
+
+export async function generateAssistantResponseNoStream(requestBody, token) {
+
+    let data;
+    let aggregatedText = '';
+    let aggregatedTextSignature = null;
+
+    try {
+        data = await callNoStreamApi(requestBody, token);
     } catch (error) {
         await handleApiError(error, token);
     }
@@ -629,80 +612,17 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     return { content, toolCalls, usage };
 }
 
+// 直接返回原始 Gemini 风格响应（用于 Gemini 兼容接口）
+export async function generateGeminiResponseNoStream(requestBody, token) {
+    try {
+        const data = await callNoStreamApi(requestBody, token);
+        // 上游返回通常为 { response: { ... } } 结构，这里只透传内部 response
+        return data?.response ?? data;
+    } catch (error) {
+        await handleApiError(error, token);
+    }
+}
+
 export function closeRequester() {
     if (requester) requester.close();
-}
-
-export async function streamGeminiContent(model, requestBody, token, onChunk) {
-
-    try {
-        await withRequesterFallback(async currentUseAxios => withRetry(async (currentToken) => {
-            const headers = buildHeaders(currentToken);
-            const payload = buildGeminiRequest(model, requestBody, currentToken);
-
-            if (currentUseAxios) {
-                const axiosConfig = { ...buildAxiosConfig(config.api.url, headers, payload), responseType: 'stream' };
-                const response = await axios(axiosConfig);
-
-                response.data.on('data', chunk => onChunk(chunk.toString()));
-                await new Promise((resolve, reject) => {
-                    response.data.on('end', resolve);
-                    response.data.on('error', reject);
-                });
-                return;
-            }
-
-            const streamResponse = requester.antigravity_fetchStream(
-                config.api.url,
-                buildRequesterConfig(headers, payload)
-            );
-            let errorBody = '';
-            let statusCode = null;
-
-            await new Promise((resolve, reject) => {
-                streamResponse
-                    .onStart(({ status }) => {
-                        statusCode = status;
-                    })
-                    .onData(chunk => (statusCode !== 200 ? (errorBody += chunk) : onChunk(chunk)))
-                    .onEnd(() => (statusCode !== 200 ? reject({ status: statusCode, message: errorBody }) : resolve()))
-                    .onError(reject);
-            });
-        }, token));
-    } catch (error) {
-        await handleApiError(error, token);
-    }
-}
-
-export async function generateGeminiContent(model, requestBody, token) {
-
-    try {
-        return await withRequesterFallback(async currentUseAxios => withRetry(async (currentToken) => {
-            const headers = buildHeaders(currentToken);
-            const payload = buildGeminiRequest(model, requestBody, currentToken);
-
-            if (currentUseAxios) {
-                return (await axios(buildAxiosConfig(config.api.noStreamUrl, headers, payload))).data;
-            }
-
-            const response = await requester.antigravity_fetch(
-                config.api.noStreamUrl,
-                buildRequesterConfig(headers, payload)
-            );
-            const bodyText = await response.text();
-            const embeddedError = detectEmbeddedError(bodyText);
-
-            if (response.status !== 200 || embeddedError) {
-                throw {
-                    status: embeddedError?.status ?? response.status,
-                    message: embeddedError?.message ?? bodyText,
-                    retryDelayMs: embeddedError?.retryDelayMs,
-                    disableToken: embeddedError?.disableToken
-                };
-            }
-            return JSON.parse(bodyText);
-        }, token));
-    } catch (error) {
-        await handleApiError(error, token);
-    }
 }

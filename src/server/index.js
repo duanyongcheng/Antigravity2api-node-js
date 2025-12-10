@@ -7,13 +7,12 @@ import { parseToml } from '../utils/tomlParser.js';
 import {
   generateAssistantResponse,
   generateAssistantResponseNoStream,
+  generateGeminiResponseNoStream,
   getAvailableModels,
   closeRequester,
-  generateGeminiContent,
-  streamGeminiContent,
   refreshApiClientConfig
 } from '../api/client.js';
-import { generateRequestBody } from '../utils/utils.js';
+import { generateRequestBody, generateRequestBodyFromGemini } from '../utils/utils.js';
 import { generateProjectId } from '../utils/idGenerator.js';
 import {
   mapClaudeToOpenAI,
@@ -478,10 +477,10 @@ app.get('/', (req, res) => {
   return res.redirect('/admin/login');
 });
 
-// API key check for /v1/*、/gemini/* 以及 /{credential}/v1/* endpoints（API_KEY 在启动时强制要求配置）
+// API key check for /v1/* 以及 /{credential}/v1/* endpoints（API_KEY 在启动时强制要求配置）
 const isProtectedApiPath = pathname => {
   const normalized = pathname || '';
-  return /^\/(?:[\w-]+\/)?v1\//.test(normalized) || normalized.startsWith('/gemini/');
+  return /^\/(?:[\w-]+\/)?v1\//.test(normalized);
 };
 
 function extractApiKeyFromHeaders(req) {
@@ -499,15 +498,36 @@ function extractApiKeyFromHeaders(req) {
   return candidates.find(v => v) || null;
 }
 
+function validateApiKey(req) {
+  const apiKey = config.security?.apiKey;
+  const providedKey = extractApiKeyFromHeaders(req);
+
+  if (!apiKey) {
+    return { ok: false, status: 503, message: 'API Key 未配置' };
+  }
+
+  if (!providedKey || providedKey !== apiKey) {
+    return { ok: false, status: 401, message: 'Invalid API Key' };
+  }
+
+  return { ok: true };
+}
+
+function requireApiKey(req, res, next) {
+  const result = validateApiKey(req);
+  if (!result.ok) {
+    logger.warn(`API Key 鉴权失败: ${req.method} ${req.originalUrl || req.url}`);
+    return res.status(result.status).json({ error: result.message });
+  }
+  return next();
+}
+
 app.use((req, res, next) => {
   if (isProtectedApiPath(req.path)) {
-    const apiKey = config.security?.apiKey;
-    if (apiKey) {
-      const providedKey = extractApiKeyFromHeaders(req);
-      if (providedKey !== apiKey) {
-        logger.warn(`API Key验证失败: ${req.method} ${req.path}`);
-        return res.status(401).json({ error: 'Invalid API Key' });
-      }
+    const result = validateApiKey(req);
+    if (!result.ok) {
+      logger.warn(`API Key 鉴权失败: ${req.method} ${req.path}`);
+      return res.status(result.status).json({ error: result.message });
     }
   }
   next();
@@ -1310,6 +1330,153 @@ app.get('/admin/logs/:id', requirePanelAuthApi, (req, res) => {
   res.json({ log: detail });
 });
 
+function parseQuotaIndexes(rawIndexes, total) {
+  if (rawIndexes === undefined || rawIndexes === null) return null;
+
+  const normalized = Array.isArray(rawIndexes) ? rawIndexes.join(',') : String(rawIndexes);
+  const candidates = normalized
+    .split(/[,\s]+/)
+    .map(part => parseInt(part, 10))
+    .filter(num => Number.isFinite(num));
+
+  const unique = [];
+  candidates.forEach(num => {
+    const zeroBased = num > 0 ? num - 1 : num;
+    if (zeroBased >= 0 && zeroBased < total && !unique.includes(zeroBased)) {
+      unique.push(zeroBased);
+    }
+  });
+
+  return unique;
+}
+
+function formatQuotaForResponse(quotaResult) {
+  const quota = {};
+  const models = quotaResult?.models || {};
+
+  Object.entries(models).forEach(([modelId, info]) => {
+    const remainingFraction = Number.isFinite(Number(info?.remaining))
+      ? Number(info.remaining)
+      : Number(info?.remainingFraction ?? 0);
+    const modelQuota = { remainingFraction: remainingFraction || 0 };
+    if (info?.resetTime) modelQuota.resetTime = info.resetTime;
+    if (info?.resetTimeRaw) modelQuota.resetTimeRaw = info.resetTimeRaw;
+    quota[modelId] = modelQuota;
+  });
+
+  return {
+    code: '成功为200',
+    msg: '成功就写获取成功',
+    quota
+  };
+}
+
+function mergeQuota(aggregate, quotaMap) {
+  Object.entries(quotaMap || {}).forEach(([modelId, info]) => {
+    if (!aggregate[modelId]) {
+      aggregate[modelId] = { remainingFraction: 0 };
+      if (info.resetTime) aggregate[modelId].resetTime = info.resetTime;
+      if (info.resetTimeRaw) aggregate[modelId].resetTimeRaw = info.resetTimeRaw;
+    }
+    const value = Number.isFinite(Number(info?.remainingFraction))
+      ? Number(info.remainingFraction)
+      : 0;
+    aggregate[modelId].remainingFraction += value;
+  });
+  return aggregate;
+}
+
+// API Key 鉴权的额度查询接口
+app.get('/admin/quota/list', requireApiKey, (req, res) => {
+  try {
+    if (!fs.existsSync(ACCOUNTS_FILE)) {
+      return res.json({ code: '成功为200', msg: '成功就写获取成功', enabled: 0 });
+    }
+
+    const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    const enabled = Array.isArray(accounts)
+      ? accounts.filter(acc => acc && acc.enable !== false).length
+      : 0;
+
+    return res.json({ code: '成功为200', msg: '成功就写获取成功', enabled });
+  } catch (e) {
+    logger.error('/admin/quota/list 获取启用凭证数量失败:', e.message);
+    return res
+      .status(500)
+      .json({ error: e.message || '获取启用凭证数量失败' });
+  }
+});
+
+app.get('/admin/quota/all', requireApiKey, async (req, res) => {
+  try {
+    if (!fs.existsSync(ACCOUNTS_FILE)) {
+      return res.status(404).json({ error: 'accounts.json 不存在' });
+    }
+
+    const accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+      return res.status(404).json({ error: '暂无可用凭证' });
+    }
+
+    const indexes = parseQuotaIndexes(
+      req.query.ids ?? req.query.index ?? req.query.credentials,
+      accounts.length
+    );
+    const targetIndexes =
+      indexes && indexes.length > 0
+        ? indexes
+        : accounts
+            .map((_, idx) => idx)
+            .filter(idx => accounts[idx]?.enable !== false);
+
+    if (targetIndexes.length === 0) {
+      return res.status(404).json({ error: '没有匹配的启用凭证' });
+    }
+
+    const payload = {};
+    const aggregateQuota = {};
+
+    for (const idx of targetIndexes) {
+      const account = accounts[idx];
+      const label = `凭证${idx + 1}`;
+
+      if (!account || account.enable === false) {
+        payload[label] = { code: '403', msg: '凭证未启用', quota: {} };
+        continue;
+      }
+
+      if (!account.refresh_token) {
+        payload[label] = { code: '400', msg: '凭证缺少 refresh_token', quota: {} };
+        continue;
+      }
+
+      try {
+        const quotaResult = await quotaManager.getQuotas(account.refresh_token, account);
+        const formatted = formatQuotaForResponse(quotaResult);
+        payload[label] = formatted;
+        mergeQuota(aggregateQuota, formatted.quota);
+      } catch (e) {
+        payload[label] = {
+          code: '500',
+          msg: e.message || '获取额度失败',
+          quota: {}
+        };
+      }
+    }
+
+    payload.all = {
+      code: '成功为200',
+      msg: '成功就写获取成功',
+      quota: aggregateQuota
+    };
+
+    return res.json(payload);
+  } catch (e) {
+    logger.error('/admin/quota/all 获取额度失败:', e.message);
+    return res.status(500).json({ error: e.message || '获取额度失败' });
+  }
+});
+
 // 额度查询接口
 app.get('/admin/tokens/:index/quotas', requirePanelAuthApi, async (req, res) => {
   try {
@@ -1592,6 +1759,72 @@ app.get('/v1/lits', (req, res) => {
   });
 });
 
+// Gemini 兼容接口：非流式 GenerateContent，直接接收 Gemini Request 并通过 AntigravityRequester 调用后端
+app.post('/v1beta/models/:model\\:generateContent', async (req, res) => {
+  const startedAt = Date.now();
+  const requestSnapshot = createRequestSnapshot(req);
+  const model = req.params.model || req.body?.model || 'unknown';
+
+  let token = null;
+  let responseBodyForLog = null;
+
+  const writeLog = ({ success, status, message }) =>
+    appendLog({
+      timestamp: new Date().toISOString(),
+      model,
+      projectId: token?.projectId || null,
+      success,
+      status,
+      message,
+      durationMs: Date.now() - startedAt,
+      path: req.originalUrl,
+      method: req.method,
+      detail: {
+        request: requestSnapshot,
+        response: {
+          status,
+          headers: res.getHeaders ? res.getHeaders() : undefined,
+          body: responseBodyForLog
+        }
+      }
+    });
+
+  try {
+    const body = req.body || {};
+    if (!Array.isArray(body.contents) || body.contents.length === 0) {
+      const status = 400;
+      const message = 'contents is required for Gemini generateContent';
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
+    token = await tokenManager.getToken();
+    if (!token) {
+      const status = 503;
+      const message = '没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。';
+      res.status(status).json({ error: message });
+      writeLog({ success: false, status, message });
+      return;
+    }
+
+    // 将 Gemini 原生请求包装成 Antigravity 请求体
+    const requestBody = generateRequestBodyFromGemini(body, model, token);
+
+    // 当前只支持非流式：即官方 Gemini 的 :generateContent 语义
+    const geminiResponse = await generateGeminiResponseNoStream(requestBody, token);
+    responseBodyForLog = geminiResponse;
+
+    res.json(geminiResponse);
+    writeLog({ success: true, status: res.statusCode || 200 });
+  } catch (error) {
+    const status = 500;
+    const message = error?.message || 'Gemini generateContent 调用失败';
+    res.status(status).json({ error: message });
+    writeLog({ success: false, status, message });
+  }
+});
+
 app.post('/v1/chat/completions', createChatCompletionHandler(() => tokenManager.getToken()));
 app.post(
   '/:credential/v1/chat/completions',
@@ -1752,108 +1985,6 @@ app.post('/v1/messages', async (req, res) => {
       res.status(status).json({ error: error?.message || '鏈嶅姟鍣ㄥけ璐?' });
     }
     writeLog({ success: false, status, message: error?.message });
-  }
-});
-
-app.post(/^\/gemini\/v1beta\/models\/([^/]+):streamGenerateContent$/, async (req, res) => {
-  const model = req.params[0];
-  const startedAt = Date.now();
-  const requestSnapshot = createRequestSnapshot(req);
-  const capturedChunks = [];
-  let token = null;
-
-  const writeLog = ({ success, status, message, body }) =>
-    appendLog({
-      timestamp: new Date().toISOString(),
-      model,
-      projectId: token?.projectId || null,
-      success,
-      status,
-      message,
-      durationMs: Date.now() - startedAt,
-      path: req.originalUrl,
-      method: req.method,
-      detail: {
-        request: requestSnapshot,
-        response: {
-          status,
-          headers: res.getHeaders ? res.getHeaders() : undefined,
-          body: body ?? { stream: true, chunks: capturedChunks }
-        }
-      }
-    });
-
-  try {
-    token = await tokenManager.getToken();
-    if (!token) {
-      throw new Error('没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。');
-    }
-
-    setStreamHeaders(res);
-    await streamGeminiContent(model, req.body || {}, token, chunk => {
-      capturedChunks.push(chunk);
-      res.write(chunk);
-    });
-    res.end();
-
-    writeLog({ success: true, status: res.statusCode || 200 });
-  } catch (error) {
-    logger.error('Gemini 流式生成失败:', error.message);
-    const errorStatus = error.statusCode || (res.statusCode >= 400 ? res.statusCode : 500);
-    writeLog({ success: false, status: errorStatus, message: error.message });
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
-      res.end();
-    }
-  }
-});
-
-app.post(/^\/gemini\/v1beta\/models\/([^/]+):generateContent$/, async (req, res) => {
-  const model = req.params[0];
-  const startedAt = Date.now();
-  const requestSnapshot = createRequestSnapshot(req);
-  let responseBodyForLog = null;
-  let token = null;
-
-  const writeLog = ({ success, status, message }) =>
-    appendLog({
-      timestamp: new Date().toISOString(),
-      model,
-      projectId: token?.projectId || null,
-      success,
-      status,
-      message,
-      durationMs: Date.now() - startedAt,
-      path: req.originalUrl,
-      method: req.method,
-      detail: {
-        request: requestSnapshot,
-        response: {
-          status,
-          headers: res.getHeaders ? res.getHeaders() : undefined,
-          body: responseBodyForLog
-        }
-      }
-    });
-
-  try {
-    token = await tokenManager.getToken();
-    if (!token) {
-      throw new Error('没有可用的 token，请先通过 OAuth 面板或 npm run login 获取。');
-    }
-
-    const data = await generateGeminiContent(model, req.body || {}, token);
-    res.json(data);
-    responseBodyForLog = data;
-
-    writeLog({ success: true, status: res.statusCode || 200 });
-  } catch (error) {
-    logger.error('Gemini 文本生成失败:', error.message);
-    const errorStatus = error.statusCode || (res.statusCode >= 400 ? res.statusCode : 500);
-    writeLog({ success: false, status: errorStatus, message: error.message });
-    res.status(500).json({ error: error.message });
   }
 });
 
