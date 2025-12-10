@@ -8,10 +8,10 @@ services:
     ports:
       - "8045:8045"
     environment:
-      - PANEL_USER=barry
-      - PANEL_PASSWORD=As1171998654
-      - API_KEY=sk-hyyO0HbrFv6D3hozzzuMLqJuYOHN2DbQAh0plswGRvksFaUc
-      - IMAGE_BASE_URL=https://gemini.dycheng.cc
+      - PANEL_USER=username
+      - PANEL_PASSWORD=password
+      - API_KEY=sk-123
+      - IMAGE_BASE_URL=url
     volumes:
       - ./data:/app/data
     healthcheck:
