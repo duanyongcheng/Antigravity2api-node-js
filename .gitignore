@@ -21,3 +21,4 @@ data/
 test/
 Docs/
 .claude/
+docker-compose.yml
