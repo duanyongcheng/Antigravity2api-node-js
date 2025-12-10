@@ -1,16 +1,17 @@
 version: '3.8'
 services:
   antigravity-api:
-    image: ghcr.io/zhongruan0522/antigravity2api-node-js:latest
+    build: .
+    image: antigravity2api:local
     container_name: antigravity-api
     restart: unless-stopped
     ports:
       - "8045:8045"
     environment:
-      - PANEL_USER=admin
-      - PANEL_PASSWORD=设置你的密码
-      - API_KEY=sk-text
-      - IMAGE_BASE_URL=设置图像访问地址，如果是服务器部署有域名写域名，无域名写IP:8045，本地不写
+      - PANEL_USER=barry
+      - PANEL_PASSWORD=As1171998654
+      - API_KEY=sk-hyyO0HbrFv6D3hozzzuMLqJuYOHN2DbQAh0plswGRvksFaUc
+      - IMAGE_BASE_URL=https://gemini.dycheng.cc
     volumes:
       - ./data:/app/data
     healthcheck:
