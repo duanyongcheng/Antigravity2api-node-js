@@ -435,26 +435,63 @@ function generateRequestBodyFromGemini(geminiRequest, modelName, token) {
   };
 }
 
+// 从文本中提取 <thinking>...</thinking> 内容
+function extractThinkingFromText(text) {
+  if (typeof text !== 'string') return { thinking: '', remaining: '' };
+
+  const thinkingRegex = /<thinking>([\s\S]*?)<\/thinking>/gi;
+  let thinking = '';
+  let remaining = text;
+
+  let match;
+  while ((match = thinkingRegex.exec(text)) !== null) {
+    thinking += (thinking ? '\n' : '') + match[1];
+  }
+
+  remaining = text.replace(thinkingRegex, '').trim();
+
+  return { thinking: thinking.trim(), remaining };
+}
+
 // 覆盖上方的 handleAssistantMessage 实现：
 // 当找不到 Gemini 思维签名时，降级为普通文本发送，而不是直接丢弃该 assistant 文本，避免导致请求 400。
+// 额外修复：从文本中提取 <thinking>...</thinking> 内容并转换为 thought: true 的 part，
+// 以满足 Vertex AI Claude API 对 thinking blocks 的要求。
 function handleAssistantMessage(message, antigravityMessages, modelName) {
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const allowThoughtSignature = typeof modelName === 'string' && modelName.includes('gemini-3');
+  const isClaudeModel = typeof modelName === 'string' && modelName.includes('claude');
 
-  // 统一提取 assistant 的纯文本内容
+  // 统一提取 assistant 的纯文本内容和 thinking 内容
   let contentText = '';
+  let thinkingFromBlocks = '';
+
   if (message.content) {
     if (Array.isArray(message.content)) {
-      contentText = message.content
-        .filter(item => item.type === 'text')
-        .map(item => item.text || '')
-        .join('');
+      // 处理数组格式，分别提取 text 和 thinking blocks
+      for (const item of message.content) {
+        if (item.type === 'text') {
+          contentText += item.text || '';
+        } else if (item.type === 'thinking') {
+          // 直接从 thinking block 中提取
+          thinkingFromBlocks += (thinkingFromBlocks ? '\n' : '') + (item.thinking || '');
+        }
+      }
     } else if (typeof message.content === 'string') {
       contentText = message.content;
     }
   }
+
+  // 从文本中提取 <thinking>...</thinking> 内容（可能是之前转换后的格式）
+  const { thinking: thinkingFromText, remaining } = extractThinkingFromText(contentText);
+  contentText = remaining;
+
+  // 合并从 blocks 和文本中提取的 thinking 内容
+  const thinking = [thinkingFromBlocks, thinkingFromText].filter(Boolean).join('\n').trim();
+
   const hasContent = contentText.trim() !== '';
+  const hasThinking = thinking !== '';
 
   // 将 OpenAI 风格的 tool_calls 转成 Antigravity/Gemini 所需的 functionCall part
   const antigravityTools = hasToolCalls ? message.tool_calls.map(toolCall => {
@@ -485,13 +522,19 @@ function handleAssistantMessage(message, antigravityMessages, modelName) {
     return part;
   }) : [];
 
-  // 如果只是补齐工具调用结果且没有新文本，直接合并到上一条 model 消息里
-  if (lastMessage?.role === 'model' && hasToolCalls && !hasContent) {
+  // 如果只是补齐工具调用结果且没有新文本和thinking，直接合并到上一条 model 消息里
+  if (lastMessage?.role === 'model' && hasToolCalls && !hasContent && !hasThinking) {
     lastMessage.parts.push(...antigravityTools);
     return;
   }
 
   const parts = [];
+
+  // 关键修复：对于 Claude 模型，当存在 thinking 内容时，必须首先添加 thinking part
+  // Vertex AI Claude API 要求当 thinking 模式启用时，assistant 消息必须以 thinking block 开头
+  if (hasThinking && isClaudeModel) {
+    parts.push({ text: thinking, thought: true });
+  }
 
   // 这里是关键改动：
   // 1. 优先尝试从缓存中找到与文本匹配的思维签名
@@ -505,6 +548,11 @@ function handleAssistantMessage(message, antigravityMessages, modelName) {
     }
 
     parts.push(textPart);
+  }
+
+  // 对于非 Claude 模型，thinking 内容放在普通文本之后（如果有的话）
+  if (hasThinking && !isClaudeModel) {
+    parts.push({ text: thinking, thought: true });
   }
 
   parts.push(...antigravityTools);
