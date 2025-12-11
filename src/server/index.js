@@ -1632,9 +1632,9 @@ const createChatCompletionHandler = (resolveToken, options = {}) => async (req, 
               function: toolCall.function
             }));
           } else if (data.type === 'thinking') {
-            // 思维链内容直接放入 reasoning_content（不包含标签）
-            const cleanContent = data.content.replace(/^<思考>\n?|\n?<\/思考>$/g, '');
-            delta.reasoning_content = cleanContent;
+            // 思维链内容：跳过，不发送给客户端
+            // Claude Code 使用 OpenAI 格式时不支持 reasoning_content，发送会导致显示问题
+            // 思维内容已在服务端处理，只需要发送最终文本结果
           } else if (data.type === 'text') {
             // 普通文本内容放入 content（需要过滤掉思考标签）
             const cleanContent = data.content.replace(/<思考>[\s\S]*?<\/思考>/g, '');
